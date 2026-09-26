@@ -1,0 +1,418 @@
+name: Flutter APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project"
+        required: true
+      tag:
+        description: "Unique build tag"
+        required: true
+      build_type:
+        description: "debug or release"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+      user_id:
+        description: "Telegram user ID"
+        required: false
+        default: "unknown"
+      only_analyze:
+        description: "Analyze only (skip build)"
+        required: false
+        default: "false"
+      flutter_version:
+        description: "Flutter version (kosongkan = auto-detect dari pubspec)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ─── 1. WORKSPACE ───────────────────────────────────────────────────────
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf project_raw project.zip build-output build-logs
+          mkdir -p project_raw build-output build-logs
+          echo "Workspace ready."
+
+      # ─── 2. DOWNLOAD ZIP ────────────────────────────────────────────────────
+      - name: Download project ZIP
+        shell: bash
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          USER_ID: ${{ inputs.user_id }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "📥 Downloading project..."
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 600 \
+            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            -o project.zip "$ZIP_URL"
+
+          test -s project.zip
+          unzip -t project.zip >/dev/null
+          unzip -q project.zip -d project_raw
+
+          SAFE_USER_ID="$(printf '%s' "${USER_ID:-unknown}" | tr -cd '0-9_-')"
+          [ -n "$SAFE_USER_ID" ] || SAFE_USER_ID="unknown"
+          USER_BUILD_DIR="$GITHUB_WORKSPACE/builds/$SAFE_USER_ID"
+          rm -rf "$GITHUB_WORKSPACE/builds"
+          mkdir -p "$USER_BUILD_DIR"
+          cp -a project_raw/. "$USER_BUILD_DIR/"
+
+          PUBSPEC="$(find "$USER_BUILD_DIR" -type f -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' \
+            -not -path '*/.git/*' \
+            | awk '{ print gsub(/\//,"/"), $0 }' | sort -n | head -1 | cut -d' ' -f2- || true)"
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan — ini bukan project Flutter."
+            echo "=== File ditemukan di ZIP ==="
+            find "$USER_BUILD_DIR" -maxdepth 6 -type f | sort | head -200
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+
+          echo "BUILD_DIR=$USER_BUILD_DIR"   >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT_DIR"    >> "$GITHUB_ENV"
+          echo "SAFE_USER_ID=$SAFE_USER_ID"  >> "$GITHUB_ENV"
+          echo "PUBSPEC_PATH=$PUBSPEC"       >> "$GITHUB_ENV"
+
+          {
+            echo "PROJECT_TYPE=flutter"
+            echo "PROJECT_DIR=$PROJECT_DIR"
+            echo "PUBSPEC=$PUBSPEC"
+          } | tee build-logs/project-analysis.txt
+
+          echo "✅ Project Flutter ditemukan: $PROJECT_DIR"
+
+      # ─── 3. JDK ─────────────────────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # ─── 4. ANDROID SDK ─────────────────────────────────────────────────────
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      # ─── 5. DETECT FLUTTER VERSION ──────────────────────────────────────────
+      - name: Detect required Flutter version from pubspec
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          FLUTTER_VER="${{ inputs.flutter_version }}"
+
+          if [ -z "$FLUTTER_VER" ] && [ -n "${PUBSPEC_PATH:-}" ] && [ -f "$PUBSPEC_PATH" ]; then
+            # Baca sdk constraint dari pubspec.yaml
+            SDK_LINE="$(grep 'sdk:' "$PUBSPEC_PATH" | grep -v 'flutter' | head -1 || true)"
+            echo "📋 SDK line: $SDK_LINE"
+
+            # Ambil angka versi minimum
+            MIN_DART="$(echo "$SDK_LINE" | grep -oP '\d+\.\d+\.\d+' | head -1 || true)"
+            echo "🎯 Min Dart required: ${MIN_DART:-tidak ditemukan}"
+
+            if [ -n "$MIN_DART" ]; then
+              DART_MINOR="$(echo "$MIN_DART" | cut -d. -f2)"
+              DART_PATCH="$(echo "$MIN_DART" | cut -d. -f3)"
+
+              # Map Dart → Flutter version
+              # Dart 3.8.x → Flutter 3.32.x (bundled Dart 3.8.1)
+              # Dart 3.7.x → Flutter 3.29.x
+              # Dart 3.6.x → Flutter 3.27.x
+              # Dart 3.5.x → Flutter 3.24.x
+              # Dart 3.4.x → Flutter 3.22.x
+              case "$DART_MINOR" in
+                8|9|10) FLUTTER_VER="3.32.2" ;;
+                7)      FLUTTER_VER="3.29.0" ;;
+                6)      FLUTTER_VER="3.27.0" ;;
+                5)      FLUTTER_VER="3.24.0" ;;
+                4)      FLUTTER_VER="3.22.0" ;;
+                *)      FLUTTER_VER="" ;;
+              esac
+
+              echo "✅ Flutter version dipilih otomatis: ${FLUTTER_VER:-stable terbaru}"
+            else
+              echo "ℹ️  Tidak bisa baca dart version, pakai stable terbaru"
+            fi
+          else
+            echo "ℹ️  flutter_version dari input: ${FLUTTER_VER:-kosong, pakai stable}"
+          fi
+
+          echo "FLUTTER_RESOLVED_VERSION=${FLUTTER_VER}" >> "$GITHUB_ENV"
+
+      # ─── 6. FLUTTER ─────────────────────────────────────────────────────────
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_RESOLVED_VERSION }}
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: Flutter version info
+        shell: bash
+        run: |
+          flutter config --no-analytics 2>/dev/null || true
+          flutter --version 2>&1 | tee build-logs/flutter-version.log
+          dart --version   2>&1 >> build-logs/flutter-version.log
+
+      # ─── 7. PASTIKAN ANDROID FOLDER ADA ─────────────────────────────────────
+      - name: Ensure android folder exists
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ ! -d "android" ] || [ ! -f "android/gradlew" ]; then
+            echo "⚠️  android/ folder tidak lengkap, regenerate..."
+            flutter create --platforms=android --no-pub . 2>&1 | tee build-logs/flutter-create.log
+          else
+            echo "✅ android/ folder sudah ada."
+          fi
+
+      # ─── 8. PUB GET ──────────────────────────────────────────────────────────
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$HOME/.pub-cache"
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+
+          echo "📦 Running flutter pub get..."
+          flutter pub get 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
+          PUB_EXIT="${PIPESTATUS[0]}"
+
+          # Fallback 1: pub upgrade
+          if [ "$PUB_EXIT" -ne 0 ]; then
+            echo ""
+            echo "⚠️  pub get gagal — mencoba flutter pub upgrade..."
+            flutter pub upgrade 2>&1 | tee -a "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
+            PUB_EXIT="${PIPESTATUS[0]}"
+          fi
+
+          # Fallback 2: relax SDK constraint
+          if [ "$PUB_EXIT" -ne 0 ]; then
+            echo ""
+            echo "⚠️  pub upgrade juga gagal — mencoba relax SDK constraint..."
+            cp pubspec.yaml pubspec.yaml.bak
+            sed -i 's/sdk: *"[^"]*"/sdk: ">=3.0.0 <4.0.0"/g' pubspec.yaml
+            sed -i "s/sdk: *'[^']*'/sdk: '>=3.0.0 <4.0.0'/g" pubspec.yaml
+            echo "--- pubspec.yaml setelah patch ---"
+            grep -A2 'environment:' pubspec.yaml || true
+            flutter pub get 2>&1 | tee -a "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
+            PUB_EXIT="${PIPESTATUS[0]}"
+          fi
+
+          if [ "$PUB_EXIT" -ne 0 ]; then
+            echo ""
+            echo "::error::flutter pub get gagal (exit $PUB_EXIT) — semua fallback sudah dicoba."
+            echo "=== pubspec.yaml ==="
+            cat pubspec.yaml
+            echo "=== TAIL PUB GET LOG ==="
+            tail -n 80 "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
+            echo "=== TAIL PUB GET LOG ==="
+            exit "$PUB_EXIT"
+          fi
+
+          echo "✅ pub get selesai!"
+
+      # ─── 9. ANALYZE ──────────────────────────────────────────────────────────
+      - name: Flutter analyze
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          flutter analyze --no-fatal-infos 2>&1 | tee build-logs/flutter-analyze.log || true
+
+      # ─── 10. BUILD APK ───────────────────────────────────────────────────────
+      - name: Build Flutter APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          TYPE="${{ inputs.build_type }}"
+          LOG="$GITHUB_WORKSPACE/build-logs/flutter-build.log"
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+
+          echo "🔨 Building: flutter build apk --${TYPE}"
+          echo "📁 PROJECT_DIR: $PWD"
+          echo "📋 pubspec.yaml content:"
+          cat pubspec.yaml | head -20
+
+          # Run build dengan output langsung ke file DAN stdout
+          flutter build apk --"$TYPE"             --verbose             --no-shrink             2>&1 | tee "$LOG" ; BUILD_EXIT="${PIPESTATUS[0]}"
+
+          echo ""
+          echo "=== BUILD EXIT CODE: $BUILD_EXIT ==="
+
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo ""
+            echo "::error::Flutter build gagal (exit $BUILD_EXIT)"
+            echo ""
+            echo "=== TAIL BUILD LOG (last 150 lines) ==="
+            tail -n 150 "$LOG" || true
+            echo ""
+            echo "=== GRADLE ERRORS ==="
+            grep -i "error\|exception\|failed\|FAILED" "$LOG" | tail -n 50 || true
+            exit "$BUILD_EXIT"
+          fi
+
+          echo "✅ Build selesai!"
+
+      # ─── 11. COLLECT APK ─────────────────────────────────────────────────────
+      - name: Collect APK
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          # Cari APK di semua kemungkinan lokasi
+          echo "=== Mencari APK... ==="
+          find "$GITHUB_WORKSPACE" -type f -name '*.apk' 2>/dev/null | head -20 || true
+
+          find "$GITHUB_WORKSPACE/project_raw" -type f -name '*.apk' \
+            -exec cp -f {} build-output/ \; 2>/dev/null || true
+          find "$GITHUB_WORKSPACE/builds" -type f -name '*.apk' \
+            -exec cp -f {} build-output/ \; 2>/dev/null || true
+          # Fallback: cari di seluruh workspace
+          find "$GITHUB_WORKSPACE" -type f -name '*.apk' \
+            -not -path '*/build-output/*' \
+            -exec cp -f {} build-output/ \; 2>/dev/null || true
+
+          echo "=== APK di build-output ==="
+          ls -lh build-output/ || true
+
+          APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [ -n "$APK" ]; then
+            AAPT=""
+            if [ -n "${ANDROID_HOME:-}" ]; then
+              AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt -perm -111 2>/dev/null | sort -V | tail -n 1)"
+            fi
+            [ -z "$AAPT" ] && AAPT="$(command -v aapt || true)"
+
+            APK_LABEL=""
+            APK_PACKAGE=""
+            if [ -n "$AAPT" ]; then
+              BADGING="$($AAPT dump badging "$APK" 2>/dev/null || true)"
+              APK_PACKAGE="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
+              APK_LABEL="$(printf '%s\n' "$BADGING"   | sed -n "s/^application-label:'\([^']*\)'.*/\1/p" | head -n 1)"
+            fi
+
+            [ -z "$APK_LABEL" ] && APK_LABEL="${APK_PACKAGE:-Flutter-App}"
+
+            SAFE_LABEL="$(printf '%s' "$APK_LABEL" | tr '/\\:' '---' | tr -d '\000' | \
+              sed 's/[<>"|?*]//g; s/[[:space:]][[:space:]]*/ /g; s/^ *//; s/ *$//')"
+            [ -z "$SAFE_LABEL" ] && SAFE_LABEL="Flutter-App"
+            SAFE_LABEL="${SAFE_LABEL%.}"
+
+            printf '{"application_label":"%s","package_name":"%s"}\n' \
+              "$(printf '%s' "$APK_LABEL"   | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              "$(printf '%s' "$APK_PACKAGE" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              > build-output/apk-info.json
+
+            TARGET="build-output/${SAFE_LABEL}.apk"
+            if [ "$APK" != "$TARGET" ]; then
+              rm -f "$TARGET"
+              mv "$APK" "$TARGET"
+            fi
+            echo "✅ APK: $(basename "$TARGET")"
+            echo "📦 Size: $(du -h "$TARGET" | cut -f1)"
+          fi
+
+          {
+            echo "===== PROJECT ANALYSIS ====="
+            cat build-logs/project-analysis.txt 2>/dev/null || true
+            echo
+            echo "===== FLUTTER VERSION ====="
+            cat build-logs/flutter-version.log 2>/dev/null || true
+            echo
+            echo "===== JAVA ====="
+            java -version 2>&1 || true
+            echo
+            echo "===== OUTPUT ====="
+            find build-output -maxdepth 1 -type f -exec ls -lh {} \; 2>/dev/null || true
+            echo
+            echo "===== BUILD LOG TAIL ====="
+            for f in build-logs/*build*.log; do
+              [ -f "$f" ] || continue
+              echo "----- $f -----"
+              tail -n 300 "$f"
+            done
+          } > build-logs/final-diagnostic.txt 2>&1
+
+      # ─── 12. UPLOAD APK ──────────────────────────────────────────────────────
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-${{ inputs.tag }}
+          path: build-output/*.apk
+          if-no-files-found: warn
+          retention-days: 3
+
+      # ─── 13. UPLOAD LOGS ─────────────────────────────────────────────────────
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-logs-${{ inputs.tag }}
+          path: build-logs/
+          if-no-files-found: warn
+          retention-days: 3
+
+      # ─── 14. VERIFY ──────────────────────────────────────────────────────────
+      - name: Verify APK
+        if: always()
+        shell: bash
+        run: |
+          APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+          if [ -z "$APK" ]; then
+            echo "⚠️  APK tidak ada di build-output, coba cari di workspace..."
+            APK="$(find "$GITHUB_WORKSPACE" -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+            if [ -n "$APK" ]; then
+              echo "✅ APK ketemu di: $APK"
+              cp -f "$APK" build-output/
+              APK="build-output/$(basename "$APK")"
+            else
+              echo "::error::APK tidak ditemukan di mana pun. Build mungkin gagal."
+              echo "=== Semua file di workspace ==="
+              find "$GITHUB_WORKSPACE" -name '*.apk' 2>/dev/null || echo "Tidak ada APK"
+              exit 1
+            fi
+          fi
+          echo "✅ APK: $(basename "$APK")"
+          echo "📦 Size: $(du -h "$APK" | cut -f1)"
+
+      # ─── 15. CLEANUP ─────────────────────────────────────────────────────────
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          [ -n "${BUILD_DIR:-}" ] && [ -d "$BUILD_DIR" ] && rm -rf "$BUILD_DIR"
+          rm -f project.zip
+          rm -rf project_raw
+          echo "🧹 Cleanup done."
