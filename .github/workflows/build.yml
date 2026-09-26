@@ -1,0 +1,429 @@
+name: Android APK Builder - Flutter + Native
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project"
+        required: true
+      tag:
+        description: "Unique build tag"
+        required: true
+      build_type:
+        description: "debug or release"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+      only_analyze:
+        description: "Analyze only"
+        required: false
+        default: "false"
+      user_id:
+        description: "Telegram user ID"
+        required: false
+        default: "unknown"
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf project_raw project.zip build-output build-logs
+          mkdir -p project_raw build-output build-logs
+          echo "Workspace ready."
+
+      - name: Download and prepare project
+        id: prepare
+        shell: bash
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          USER_ID: ${{ inputs.user_id }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "📥 Downloading project..."
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 600 \
+            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            -o project.zip "$ZIP_URL"
+
+          test -s project.zip
+          unzip -t project.zip >/dev/null
+          unzip -q project.zip -d project_raw
+
+          SAFE_USER_ID="$(printf '%s' "${USER_ID:-unknown}" | tr -cd '0-9_-')"
+          [ -n "$SAFE_USER_ID" ] || SAFE_USER_ID="unknown"
+          USER_BUILD_DIR="$GITHUB_WORKSPACE/builds/$SAFE_USER_ID"
+          rm -rf "$GITHUB_WORKSPACE/builds"
+          mkdir -p "$USER_BUILD_DIR"
+          cp -a project_raw/. "$USER_BUILD_DIR/"
+
+          PUBSPEC="$(find "$USER_BUILD_DIR" -type f -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' -not -path '*/.git/*' -print -quit || true)"
+          GRADLEW="$(find "$USER_BUILD_DIR" -type f -name gradlew \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
+          SETTINGS="$(find "$USER_BUILD_DIR" -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
+          BUILD_GRADLE="$(find "$USER_BUILD_DIR" -type f \
+            \( -name build.gradle -o -name build.gradle.kts \) \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
+
+          if [ -n "$PUBSPEC" ]; then
+            PROJECT_TYPE="flutter"
+            PROJECT_DIR="$(dirname "$PUBSPEC")"
+          elif [ -n "$GRADLEW" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$GRADLEW")"
+          elif [ -n "$SETTINGS" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$SETTINGS")"
+          elif [ -n "$BUILD_GRADLE" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$BUILD_GRADLE")"
+          else
+            echo "::error::Project Flutter/Native tidak ditemukan."
+            find "$USER_BUILD_DIR" -maxdepth 7 -type f | sort | head -300
+            exit 1
+          fi
+
+          echo "BUILD_DIR=$USER_BUILD_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_TYPE=$PROJECT_TYPE" >> "$GITHUB_ENV"
+          echo "SAFE_USER_ID=$SAFE_USER_ID" >> "$GITHUB_ENV"
+
+          {
+            echo "PROJECT_TYPE=$PROJECT_TYPE"
+            echo "PROJECT_DIR=$PROJECT_DIR"
+            echo "USER_BUILD_DIR=$USER_BUILD_DIR"
+            echo "PUBSPEC=${PUBSPEC:-not found}"
+            echo "GRADLEW=${GRADLEW:-not found}"
+            echo "SETTINGS=${SETTINGS:-not found}"
+          } | tee build-logs/project-analysis.txt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # Do not use android-actions/setup-android here. The runner already ships
+      # with the Android SDK, and direct sdkmanager setup is more reliable for
+      # native projects whose mipmap/resources may be incomplete.
+      - name: Set up Android SDK (manual)
+        if: env.PROJECT_TYPE == 'native'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            for candidate in \
+              "$RUNNER_TOOL_CACHE/android-sdk" \
+              "$HOME/Android/Sdk" \
+              "/usr/local/lib/android/sdk"; do
+              if [ -d "$candidate" ]; then SDK_ROOT="$candidate"; break; fi
+            done
+          fi
+
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK tidak ditemukan di runner."
+            echo "ANDROID_HOME=${ANDROID_HOME:-<empty>}"
+            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<empty>}"
+            exit 1
+          fi
+
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/cmdline-tools/bin" >> "$GITHUB_PATH"
+          echo "SDK_ROOT=$SDK_ROOT" | tee build-logs/android-sdk.txt
+
+          SDKMANAGER=""
+          for candidate in \
+            "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools/bin/sdkmanager" \
+            "$(command -v sdkmanager 2>/dev/null || true)"; do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then SDKMANAGER="$candidate"; break; fi
+          done
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager tidak ditemukan."
+            find "$SDK_ROOT" -maxdepth 5 -type f -name sdkmanager -print || true
+            exit 1
+          fi
+
+          # Read compileSdk when possible. Base khusu uses 34, but this also
+          # supports other native bases without requiring a hard-coded version.
+          COMPILE_SDK="$(grep -RhoE 'compileSdk(Value)?[^0-9]*[0-9]+' "$PROJECT_DIR" \
+            --include='build.gradle' --include='build.gradle.kts' 2>/dev/null \
+            | grep -oE '[0-9]+' | head -1 || true)"
+          [ -n "$COMPILE_SDK" ] || COMPILE_SDK="34"
+
+          BUILD_TOOLS=""
+          if [ -d "$SDK_ROOT/build-tools" ]; then
+            BUILD_TOOLS="$(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+              | sort -V | tail -1 || true)"
+          fi
+          [ -n "$BUILD_TOOLS" ] || BUILD_TOOLS="34.0.0"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-${COMPILE_SDK}" "build-tools;${BUILD_TOOLS}" \
+            2>&1 | tee -a build-logs/android-sdk.txt
+
+          echo "COMPILE_SDK=$COMPILE_SDK" >> "$GITHUB_ENV"
+          echo "BUILD_TOOLS=$BUILD_TOOLS" >> "$GITHUB_ENV"
+
+      - name: Prepare missing Android mipmap resources
+        if: env.PROJECT_TYPE == 'native'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          RES_DIR="${PROJECT_DIR}/app/src/main/res"
+          if [ ! -d "$RES_DIR" ]; then
+            echo "No Android res directory found; skipping mipmap preparation."
+            exit 0
+          fi
+
+          python3 - "$RES_DIR" <<'PY'
+          import os, re, sys, struct, zlib
+
+          res_dir = os.path.abspath(sys.argv[1])
+          refs = set()
+
+          # Read all Android XML resources and the manifest. Any missing
+          # @mipmap/name referenced by the project gets a minimal valid PNG.
+          for root, _, files in os.walk(res_dir):
+              for fn in files:
+                  if fn.endswith('.xml'):
+                      p = os.path.join(root, fn)
+                      try:
+                          text = open(p, 'r', encoding='utf-8', errors='ignore').read()
+                      except Exception:
+                          continue
+                      refs.update(re.findall(r'@mipmap/([A-Za-z0-9_]+)', text))
+
+          manifest = os.path.join(os.path.dirname(res_dir), 'AndroidManifest.xml')
+          if os.path.isfile(manifest):
+              text = open(manifest, 'r', encoding='utf-8', errors='ignore').read()
+              refs.update(re.findall(r'@mipmap/([A-Za-z0-9_]+)', text))
+
+          # Also support Kotlin/Java references such as R.mipmap.ic_launcher.
+          src_root = os.path.join(os.path.dirname(res_dir), 'java')
+          if os.path.isdir(src_root):
+              for root, _, files in os.walk(src_root):
+                  for fn in files:
+                      if fn.endswith(('.kt', '.java')):
+                          try:
+                              text = open(os.path.join(root, fn), 'r', encoding='utf-8', errors='ignore').read()
+                          except Exception:
+                              continue
+                          refs.update(re.findall(r'R\.mipmap\.([A-Za-z0-9_]+)', text))
+
+          if not refs:
+              print('No @mipmap references found; no resources needed.')
+              raise SystemExit(0)
+
+          densities = {
+              'mipmap-mdpi': 48,
+              'mipmap-hdpi': 72,
+              'mipmap-xhdpi': 96,
+              'mipmap-xxhdpi': 144,
+              'mipmap-xxxhdpi': 192,
+          }
+
+          def chunk(kind, data):
+              return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
+
+          def make_png(path, size):
+              # Small opaque blue-gray square with a white center mark.
+              # Generated with Python stdlib only; no Pillow/ImageMagick needed.
+              rows = []
+              c = max(1, size // 8)
+              for y in range(size):
+                  row = bytearray([0])
+                  for x in range(size):
+                      edge = x < c or x >= size-c or y < c or y >= size-c
+                      mark = (size*3//8 <= x < size*5//8 and size*3//8 <= y < size*5//8)
+                      if mark:
+                          rgb = (255,255,255,255)
+                      elif edge:
+                          rgb = (45,45,55,255)
+                      else:
+                          rgb = (55,120,180,255)
+                      row.extend(rgb)
+                  rows.append(bytes(row))
+              raw = b''.join(rows)
+              png = b'\x89PNG\r\n\x1a\n'
+              png += chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0))
+              png += chunk(b'IDAT', zlib.compress(raw, 9))
+              png += chunk(b'IEND', b'')
+              with open(path, 'wb') as f:
+                  f.write(png)
+
+          created = []
+          skipped = []
+          for name in sorted(refs):
+              exists = False
+              for root, _, files in os.walk(res_dir):
+                  if root.endswith(('mipmap-mdpi','mipmap-hdpi','mipmap-xhdpi','mipmap-xxhdpi','mipmap-xxxhdpi','mipmap-anydpi','mipmap-anydpi-v26')):
+                      if any(os.path.splitext(f)[0] == name for f in files):
+                          exists = True
+                          break
+              if exists:
+                  skipped.append(name)
+                  continue
+
+              for folder, size in densities.items():
+                  out_dir = os.path.join(res_dir, folder)
+                  os.makedirs(out_dir, exist_ok=True)
+                  out = os.path.join(out_dir, name + '.png')
+                  make_png(out, size)
+                  created.append(out)
+
+          print('Mipmap references:', ', '.join(sorted(refs)))
+          print('Mipmap files created:', len(created))
+          print('Existing resources preserved:', ', '.join(skipped) if skipped else 'none')
+          PY
+
+          echo "===== MIPMAP AFTER PREPARATION ====="
+          find "$RES_DIR" -type f \( -path '*/mipmap-*/*' -o -name '*mipmap*' \) | sort | head -200 || true
+
+      - name: Set up Flutter
+        if: env.PROJECT_TYPE == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: Prepare Flutter Android host
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ ! -f gradlew ] && [ ! -f android/gradlew ]; then
+            flutter create --platforms=android --no-pub .
+          fi
+
+      - name: Flutter dependencies
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          flutter pub get 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
+
+      - name: Build Flutter APK
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          TYPE="${{ inputs.build_type }}"
+          flutter build apk --"$TYPE" -v 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-build.log"
+
+      - name: Build Native Android APK
+        if: env.PROJECT_TYPE == 'native'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG="$GITHUB_WORKSPACE/build-logs/native-build.log"
+
+          if [ "${{ inputs.only_analyze }}" = "true" ]; then
+            echo "Analyze-only requested; build skipped." | tee "$LOG"
+            exit 0
+          fi
+
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee "$LOG"
+            else
+              ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee "$LOG"
+            fi
+          else
+            echo "⚠️ Gradle wrapper lengkap tidak tersedia. Menggunakan Gradle 8.4 langsung." | tee "$LOG"
+            GRADLE_VERSION="8.4"
+            curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 600 \
+              -o "$RUNNER_TEMP/gradle.zip" \
+              "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" 2>&1 | tee -a "$LOG"
+            rm -rf "$RUNNER_TEMP/gradle"
+            unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP/gradle"
+            GRADLE_BIN="$RUNNER_TEMP/gradle/gradle-${GRADLE_VERSION}/bin/gradle"
+
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              "$GRADLE_BIN" --no-daemon --stacktrace assembleDebug 2>&1 | tee -a "$LOG"
+            else
+              "$GRADLE_BIN" --no-daemon --stacktrace assembleRelease 2>&1 | tee -a "$LOG"
+            fi
+          fi
+
+      - name: Collect APK and diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find "$GITHUB_WORKSPACE/project_raw" -type f -name '*.apk' \
+            -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
+          find "$GITHUB_WORKSPACE/builds" -type f -name '*.apk' \
+            -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
+
+          {
+            echo "===== PROJECT ANALYSIS ====="
+            cat build-logs/project-analysis.txt 2>/dev/null || true
+            echo
+            echo "===== ANDROID SDK ====="
+            cat build-logs/android-sdk.txt 2>/dev/null || true
+            echo
+            echo "===== JAVA ====="
+            java -version 2>&1 || true
+            echo
+            echo "===== OUTPUT ====="
+            find build-output -maxdepth 1 -type f -exec ls -lh {} \; 2>/dev/null || true
+            echo
+            echo "===== BUILD LOG TAIL ====="
+            for f in build-logs/*build.log; do
+              [ -f "$f" ] || continue
+              echo "----- $f -----"
+              tail -n 300 "$f"
+            done
+          } > build-logs/final-diagnostic.txt 2>&1
+
+      - name: Upload APK
+        if: success() && inputs.only_analyze != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-${{ inputs.tag }}
+          path: build-output/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-logs-${{ inputs.tag }}
+          path: build-logs/
+          if-no-files-found: warn
+          retention-days: 3
